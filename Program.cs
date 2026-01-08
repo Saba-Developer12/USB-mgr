@@ -130,7 +130,7 @@ namespace RufusAnalog
                 IsoMountedAt = "ISO амонтировано ала {0}";
                 CopyingFiles = "Афайлқәа USB ала аԥхьარа...";
                 DismountingIso = "ISO адисмонтирование...";
-                BootableSuccess = "Аԥхьаара USB ала аԥхьაара аҭыҵра ала!";
+                BootableSuccess = "Аԥхьаара USB ала аԥхьаара аҭыҵра ала!";
                 Success = "Аԥхьаара";
                 ErrorFormat = "Агәра: {0}";
                 Error = "Агәра";
@@ -141,7 +141,7 @@ namespace RufusAnalog
                 MountOutput = "Амонт аҭыҵра: {0}";
                 CreateFileFailed = "CreateFile ала: {0}";
                 DeviceIoControlFailed = "DeviceIoControl ала: {0}";
-                CleanupFiles = "Адыррақәа аფайлқәа ала асақәа аҭыҵра (асистематә қәа ахалхҳәтәуп ала)...";
+                CleanupFiles = "Адыррақәа афайлқәа ала асақәа аҭыҵра (асистематә қәа ахалхҳәтәуп ала)...";
                 CleanupComplete = "Агасупҭауеа аҭыҵра ала.";
             }
             else if (lang == "ace")
@@ -407,8 +407,6 @@ namespace RufusAnalog
                 AppendLog($"USB drive letter: {usbLetter}");
                 UpdateProgress(10);
 
-                // ✅ ფაილური სისტემის შემოწმება სრულიად გამორთულია — გრძელდება მხოლოდ წაშლა
-
                 // Delete all non-system files & folders
                 AppendLog(Localization.CleanupFiles);
                 try
@@ -450,7 +448,7 @@ namespace RufusAnalog
                     AppendLog(string.Format(Localization.IsoMountedAt, mountedLetter));
                     UpdateProgress(40);
 
-                    // Step 3: Copy files (progress-aware)
+                    // Step 3: Copy files (ultra-fast multithreaded)
                     AppendLog(Localization.CopyingFiles);
                     CopyDirectoryWithProgress(mountedLetter, usbLetter + "\\");
                     UpdateProgress(80);
@@ -482,35 +480,118 @@ namespace RufusAnalog
             }
         }
 
+        // 🚀 ULTRA-FAST COPY — 128KB buffer, async, 8 parallel, no WriteThrough
         private void CopyDirectoryWithProgress(string sourceDir, string targetDir)
         {
+            AppendLog($"📁 Starting copy from: {sourceDir}");
+            AppendLog($"📂 Target: {targetDir}");
+
             var files = Directory.GetFiles(sourceDir, "*.*", SearchOption.AllDirectories);
             int totalFiles = files.Length;
-            int copied = 0;
+            long totalBytes = files.Sum(f => new FileInfo(f).Length);
+            long copiedBytes = 0;
+            var stopwatch = Stopwatch.StartNew();
+
+            // 1️⃣ წინასწარ შევქმნათ ყველა საქაღალდე
+            var directories = new HashSet<string>();
+            foreach (string file in files)
+            {
+                string relativePath = GetRelativePath(sourceDir, file);
+                string destFile = Path.Combine(targetDir, relativePath);
+                string destDir = Path.GetDirectoryName(destFile);
+                if (!string.IsNullOrEmpty(destDir))
+                {
+                    directories.Add(destDir);
+                }
+            }
+            foreach (string dir in directories)
+            {
+                Directory.CreateDirectory(dir);
+            }
+            AppendLog($"✅ Created {directories.Count} directories.");
+
+            // 2️⃣ მრავალნაკადიანი კოპირება — 8 ერთდროულად
+            int maxConcurrency = 8;
+            var semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+            var tasks = new List<Task>();
+            object lockObj = new object();
 
             foreach (string file in files)
             {
-                string relativePath = file.Substring(sourceDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                string destFile = Path.Combine(targetDir, relativePath);
-                string destDir = Path.GetDirectoryName(destFile);
-                if (!string.IsNullOrEmpty(destDir) && !Directory.Exists(destDir))
+                string f = file; // capture for closure
+                tasks.Add(Task.Run(async () =>
                 {
-                    Directory.CreateDirectory(destDir);
-                }
+                    await semaphore.WaitAsync().ConfigureAwait(false);
+                    try
+                    {
+                        string relativePath = GetRelativePath(sourceDir, f);
+                        string destFile = Path.Combine(targetDir, relativePath);
+                        long fileSize = new FileInfo(f).Length;
+                        var fileStopwatch = Stopwatch.StartNew();
 
-                try
-                {
-                    File.Copy(file, destFile, true);
-                }
-                catch (Exception ex)
-                {
-                    AppendLog($"⚠️ Skip (copy failed): {relativePath} → {ex.Message}");
-                }
+                        // 🔥 128KB buffer, async, გარეშე WriteThrough
+                        using (var sourceStream = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.Read, 131072, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                        using (var destStream = new FileStream(destFile, FileMode.Create, FileAccess.Write, FileShare.None, 131072, FileOptions.Asynchronous))
+                        {
+                            await sourceStream.CopyToAsync(destStream, 131072).ConfigureAwait(false);
+                        }
 
-                copied++;
-                int progress = 40 + (int)(40 * (copied / (double)totalFiles)); // From 40% to 80%
-                UpdateProgress(progress);
+                        fileStopwatch.Stop();
+
+                        lock (lockObj)
+                        {
+                            copiedBytes += fileSize;
+                            int progress = 40 + (int)(40 * (copiedBytes / (double)totalBytes));
+                            UpdateProgress(progress);
+                        }
+
+                        string sizeStr = FormatBytes(fileSize);
+                        string timeStr = fileStopwatch.Elapsed.TotalSeconds < 1
+                            ? $"{fileStopwatch.Elapsed.TotalMilliseconds:0}ms"
+                            : $"{fileStopwatch.Elapsed.TotalSeconds:0.00}s";
+                        AppendLog($"✓ {relativePath} ({sizeStr}) in {timeStr}");
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendLog($"⚠️ {GetRelativePath(sourceDir, f)} → {ex.Message}");
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                }));
             }
+
+            // 3️⃣ მოველოდეთ ყველას
+            Task.WaitAll(tasks.ToArray());
+
+            stopwatch.Stop();
+
+            // 4️⃣ საბოლოო ანგარიში
+            string totalSizeStr = FormatBytes(totalBytes);
+            string elapsed = stopwatch.Elapsed.ToString(@"m\:ss");
+            double speedMBps = totalBytes / 1024.0 / 1024.0 / stopwatch.Elapsed.TotalSeconds;
+            AppendLog($"✅ Total: {totalFiles:N0} files ({totalSizeStr}) in {elapsed} | {speedMBps:0.0} MB/s");
+        }
+
+        // დამხმარე მეთოდები
+        private string GetRelativePath(string basePath, string fullPath)
+        {
+            basePath = basePath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (fullPath.StartsWith(basePath, StringComparison.OrdinalIgnoreCase))
+            {
+                return fullPath.Substring(basePath.Length);
+            }
+            return Path.GetFileName(fullPath);
+        }
+
+        private string FormatBytes(long bytes)
+        {
+            string[] suffixes = { "B", "KB", "MB", "GB", "TB" };
+            if (bytes == 0) return "0 B";
+            int i = (int)Math.Floor(Math.Log(bytes, 1024));
+            double val = bytes / Math.Pow(1024, i);
+            return $"{val:0.##} {suffixes[i]}";
         }
 
         private async Task<string> RunProcessAsync(string fileName, string arguments, bool runAsAdmin)
